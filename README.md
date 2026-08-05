@@ -1,37 +1,32 @@
 # Pure Pursuit Dashboard
 
-Target-following as a service for the Neoracer, on port 8084. The car chases AR tags or other cars: PD steering on the target's horizontal offset, throttle that brakes as the target's bounding box grows toward a stop size.
+Target-following as a service for the Neoracer, on port 8083. The car chases whatever the driver's YOLO inference node detects: PD steering on the target's horizontal offset, throttle that brakes as the target's bounding box grows toward a stop size.
 
 ## Install
 
 From a laptop on the car's network:
 
 ```
-scp -r neoracer_pursuit racecar@<car-ip>:~/pursuit
+scp -r pursuit_dashboard racecar@<car-ip>:~/pursuit
 ssh racecar@<car-ip> 'bash ~/pursuit/setup.sh'
 ```
 
-The service installs OFF: no port, power, or compute used until enabled.
+Setup installs, enables at boot, and starts the service in one step. Dashboard: `http://<car-ip>:8083`.
 
 ```
-bash ~/pursuit/setup.sh enable     # start now and at every boot
 bash ~/pursuit/setup.sh disable    # stop now and stay off across boots
+bash ~/pursuit/setup.sh enable     # turn it back on
 ```
 
-Dashboard, when enabled: `http://<car-ip>:8084`.
+## How it works
 
-## Modes
+Detections come from the driver inference node (vision_msgs/Detection2DArray on /edgetpu/inference). Detections below score_threshold are dropped, the best-scoring max_detections remain as candidates, and the largest box is the target. The model being served and the camera frame rate show in the top bar; the model is whatever model_path in the driver's inference.yaml points to.
 
-`mode` in pursuit.yaml selects the target source: 0 = AR tags, 1 = cars. Switched only by editing the file, then pressing Reset or Load. There is no UI toggle.
-
-- AR tags: ArUco DICT_6X6_250 detected straight from the camera with cv2, the same dictionary the neoracer library uses. No model involved.
-- Cars: reads the driver inference node's YOLO detections (vision_msgs/Detection2DArray on /edgetpu/inference). The model decides what is detectable; use class_filter in the driver's inference.yaml to restrict what gets chased.
-
-The largest detection above score_threshold is the target. No target means stop (with a half-second grace so a missed frame or two does not reset the throttle ramp).
+If no object is found the car KEEPS THE LAST ACTUATED COMMAND, speed and angle both, republished continuously. It does not stop on its own except by the safety_area brake or the speed slider at zero; the transmitter's SWB switch is the physical gate.
 
 ## Tuning
 
-All on the dashboard, live: speed (throttle cap, drag slider), speed_kp (stopping gain), safety_area (bbox area fraction where the car fully stops; the yellow dashed outline on the camera view is this size), angle_kp, angle_kd, score_threshold. Save writes pursuit.yaml, Reset re-reads it.
+All on the dashboard, live: speed (throttle cap, drag slider, applies while dragging), speed_kp (stopping gain), safety_area (bbox area fraction where the car fully stops; the yellow dashed outline on the camera view is this size), angle_kp, angle_kd, score_threshold, max_detections. Save writes pursuit.yaml, Reset re-reads it.
 
 ## Known conflicts on the car
 
@@ -44,4 +39,4 @@ Check with: `ros2 topic info -v /drive` (there should be exactly one publisher: 
 
 ## Safety
 
-The neoracer mux forwards /drive with no software deadman; the transmitter's SWB switch is the physical autonomy gate. The shipped yaml has speed 0.0, so the car cannot drive until the slider is raised. Speed is hard capped at 1.0. Losing the target stops the car.
+The neoracer mux forwards /drive with no software deadman; the SWB switch is the physical autonomy gate. The shipped yaml has speed 0.0, so the car cannot drive until the slider is raised. Speed is hard capped at 1.0. Remember the keep-last rule: a car that loses its target mid-turn keeps turning until the switch is flipped or the box reappears.

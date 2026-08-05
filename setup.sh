@@ -5,16 +5,14 @@
 #   scp -r neoracer_pursuit racecar@<car-ip>:~/pursuit
 #   ssh racecar@<car-ip> 'bash ~/pursuit/setup.sh'
 #
-# Installs neoracer-pursuit.service but leaves it OFF: it does not start now
-# and does not start at boot, so it takes no port, power, or compute until
-# someone turns it on with:
-#   bash ~/pursuit/setup.sh enable
-# Turn it back off (also permanent across boots) with:
-#   bash ~/pursuit/setup.sh disable
+# Installs neoracer-pursuit.service, enables it at boot, and starts it.
+# Dashboard: http://<car-ip>:8083. Idempotent: safe to re-run.
 #
-# Dashboard, when enabled: http://<car-ip>:8084. Idempotent: safe to re-run.
-# Needs the stock image (ROS Humble, /home/racecar/ros2_ws) and, for cars
-# mode, the driver's inference node publishing on /edgetpu/inference.
+# `bash setup.sh disable` stops the service and keeps it off across boots.
+# `bash setup.sh enable` turns it back on. Both are permanent.
+#
+# Needs the stock image (ROS Humble, /home/racecar/ros2_ws) and the driver's
+# inference node publishing on /edgetpu/inference.
 set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,7 +26,7 @@ if [[ "${1:-}" == "disable" ]]; then
     exit 0
 elif [[ "${1:-}" == "enable" ]]; then
     sudo systemctl enable --now "$SVC"
-    echo "$SVC enabled and started: http://$(hostname -I | awk '{print $1}'):8084"
+    echo "$SVC enabled and started: http://$(hostname -I | awk '{print $1}'):8083"
     exit 0
 fi
 
@@ -47,11 +45,9 @@ if ! cmp -s "$DEST/$SVC" "/etc/systemd/system/$SVC" 2>/dev/null; then
     echo "  $SVC: installed"
 fi
 
-# Off by default. If it is already enabled (a previous `setup.sh enable`),
-# an update re-run keeps it enabled and restarts it with the new code.
-if systemctl is-enabled --quiet "$SVC" 2>/dev/null; then
-    sudo systemctl restart "$SVC"
-    echo "$SVC updated and restarted (was enabled)."
-else
-    echo "$SVC installed but OFF. Start it with: bash ~/pursuit/setup.sh enable"
-fi
+sudo systemctl enable --now "$SVC" 2>/dev/null
+sudo systemctl restart "$SVC"    # pick up file changes on re-run
+
+sleep 3
+systemctl is-active --quiet "$SVC" || { echo "$SVC failed to start:"; systemctl status "$SVC" --no-pager | tail -5; exit 1; }
+echo "Pure Pursuit Dashboard running: http://$(hostname -I | awk '{print $1}'):8083"

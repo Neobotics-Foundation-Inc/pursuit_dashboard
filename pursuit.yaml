@@ -1,7 +1,5 @@
-# Pure Pursuit Dashboard parameters.
-# Switch mode by editing this file, then press Reset or Load on the
-# dashboard (or restart the service). There is no UI toggle for mode.
-mode: 0               # 0 = follow AR tags, 1 = follow cars (YOLO detections)
+# Pure Pursuit Dashboard parameters. Reset or Load on the dashboard
+# re-reads this file; Save writes the tuned values back into it.
 
 speed: 0.0            # top throttle 0..1. Ships at 0.0: the neoracer mux has
                       # no ROS deadman (the transmitter SWB switch is the
@@ -13,8 +11,8 @@ safety_area: 0.15     # bbox area as a fraction of the image (0..1) where the
                       # toward this size.
 angle_kp: 1.0         # steering strength on the target's horizontal offset
 angle_kd: 0.1         # steering damper. Raise this if the car wobbles.
-score_threshold: 0.5  # cars mode: ignore detections scored below this (0..1).
-                      # AR tag detection is exact, so tags ignore this.
+score_threshold: 0.5  # ignore detections scored below this (0..1)
+max_detections: 5     # keep only this many best-scoring detections
 
 # Which topics to read. Latest driver: /camera/color. Older cars: /camera.
 camera_topic: /camera/color

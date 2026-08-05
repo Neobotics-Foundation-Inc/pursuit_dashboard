@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
-"""Neoracer pure pursuit service: chase AR tags or cars, tuning dashboard.
+"""Neoracer pure pursuit service: chase YOLO detections, tuning dashboard.
 
-Same pattern as the wallfollow dashboard (stdlib HTTP + rclpy) on port 8084.
-Two stages, selected by `mode` in pursuit.yaml (file edit only, no UI toggle):
-  0: follow AR tags. ArUco DICT_6X6_250, detected here from the camera,
-     the same dictionary the neoracer library uses.
-  1: follow cars. Reads the driver inference node's YOLO detections
-     (vision_msgs/Detection2DArray on /edgetpu/inference).
+Same pattern as the wallfollow dashboard (stdlib HTTP + rclpy) on port 8083.
+Subscribes to the driver inference node's detections
+(vision_msgs/Detection2DArray on /edgetpu/inference): the highest-scoring
+detections (up to max_detections) above score_threshold are candidates and
+the largest box is the target. PD steering on the target's horizontal
+offset; throttle runs at `speed` and brakes as the box area grows toward
+`safety_area` (full stop at or beyond it, so it never rams the target).
 
-Control is identical once a target box exists: steer at the box center with
-a PD on horizontal offset, drive at `speed` and brake as the box area grows
-toward `safety_area` (full stop at or beyond it). No target means stop.
-
-CAUTION: the neoracer mux forwards /drive with no ROS deadman; the physical
-gate is the SWB switch on the transmitter. The shipped yaml has speed 0.0.
+If no object is found the car KEEPS DOING THE LAST ACTUATED COMMAND, speed
+and angle both, republished continuously so the mux never zeroes it. The
+transmitter SWB switch is the physical gate; the shipped yaml has speed 0.0.
 Steering is negated on publish: wire positive turns this car left
-(physically verified on the wallfollow service).
+(physically verified).
+
+The dashboard shows the model the inference node is serving (read from the
+driver's installed inference.yaml) and the camera's live frame rate.
 """
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -35,17 +36,20 @@ from sensor_msgs.msg import Image
 from vision_msgs.msg import Detection2DArray
 import yaml
 
-PORT = 8084
+PORT = 8083
 BASE = Path(__file__).resolve().parent
 YAML_PATH = BASE / 'pursuit.yaml'
+INFERENCE_CFG = Path('/home/racecar/ros2_ws/install/neoracer_ros2_driver'
+                     '/share/neoracer_ros2_driver/config/inference.yaml')
 
-DETECT_RATE_HZ = 15.0   # cap for on-board ArUco detection
-STALE_SEC = 0.5         # no target this long -> publish zeros
+PUBLISH_RATE_HZ = 15.0  # keep-last republish rate toward the mux
+PREVIEW_RATE_HZ = 15.0
 
 _lock = threading.Lock()
 _params: dict = {}
-_state: dict = {'detections': [], 'target': None, 'error': None,
-                'steer': 0.0, 'speed_cmd': 0.0, 'res': [0, 0], 'seen': False}
+_state: dict = {'detections': [], 'target': None, 'error': None, 'area': None,
+                'steer': 0.0, 'speed_cmd': 0.0, 'res': [0, 0],
+                'model': '?', 'cam_fps': 0.0}
 _preview = b''
 
 
@@ -53,7 +57,7 @@ def load_params():
     with _lock:
         _params.update(yaml.safe_load(YAML_PATH.read_text()))
         _params['speed'] = max(0.0, min(1.0, float(_params['speed'])))
-        _params['mode'] = 1 if str(_params['mode']).strip() == '1' else 0
+        _params.setdefault('max_detections', 5)  # older yaml files lack this key
 
 
 def save_params():
@@ -61,19 +65,18 @@ def save_params():
     text = YAML_PATH.read_text()
     with _lock:
         for k, v in _params.items():
-            if isinstance(v, (int, float)) and k != 'mode':
+            if isinstance(v, (int, float)):
                 text = re.sub(rf'(?m)^{k}:\s*[-\d.eE+]+', f'{k}: {v}', text)
     YAML_PATH.write_text(text)
 
 
-def _make_aruco_detector():
-    """Handle both the old and new cv2 aruco APIs."""
-    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250)
-    if hasattr(cv2.aruco, 'ArucoDetector'):
-        det = cv2.aruco.ArucoDetector(dictionary, cv2.aruco.DetectorParameters())
-        return lambda gray: det.detectMarkers(gray)[:2]
-    params = cv2.aruco.DetectorParameters_create()
-    return lambda gray: cv2.aruco.detectMarkers(gray, dictionary, parameters=params)[:2]
+def read_model_name():
+    """Model the driver's inference node is serving, from its installed config."""
+    try:
+        cfg = yaml.safe_load(INFERENCE_CFG.read_text())
+        return Path(cfg['inference_node']['ros__parameters']['model_path']).name
+    except (OSError, KeyError, TypeError):
+        return 'unknown'
 
 
 class PursuitNode(Node):
@@ -85,19 +88,30 @@ class PursuitNode(Node):
         self._pub = self.create_publisher(AckermannDriveStamped, '/drive', 1)
         self.create_subscription(Image, cam_topic, self._image_cb, qos_profile_sensor_data)
         self.create_subscription(Detection2DArray, det_topic, self._det_cb, 10)
-        self.create_timer(0.1, self._watchdog)
-        self._aruco = _make_aruco_detector()
-        self._last_detect = 0.0
-        self._last_target = 0.0
+        # Keep-last actuation: whatever was last commanded goes out at a
+        # fixed rate whether or not detections are arriving.
+        self.create_timer(1.0 / PUBLISH_RATE_HZ, self._actuate)
+        self._last_preview = 0.0
         self._last_error = 0.0
-        self._last_cmd = 0.0
         self._speed_cmd = 0.0
+        self._steer_cmd = 0.0
         self._res = (640, 480)
+        self._frame_stamps = []
+        with _lock:
+            _state['model'] = read_model_name()
 
-    # ---- inputs ----
+    # ---- camera: preview + fps only ----
 
     def _image_cb(self, msg):
         global _preview
+        now = time.monotonic()
+        self._frame_stamps.append(now)
+        self._frame_stamps = [t for t in self._frame_stamps if now - t < 2.0]
+        with _lock:
+            _state['cam_fps'] = round(len(self._frame_stamps) / 2.0, 1)
+        if now - self._last_preview < 1.0 / PREVIEW_RATE_HZ:
+            return
+        self._last_preview = now
         if msg.encoding == 'jpeg':
             arr = cv2.imdecode(np.frombuffer(bytes(msg.data), np.uint8), cv2.IMREAD_COLOR)
         else:
@@ -110,22 +124,17 @@ class PursuitNode(Node):
         self._res = (w, h)
         with _lock:
             p = dict(_params)
-        now = time.monotonic()
-        if now - self._last_detect >= 1.0 / DETECT_RATE_HZ:
-            self._last_detect = now
-            pw = int(p['preview_width'])
-            small = cv2.resize(arr, (pw, max(1, round(pw * h / w))))
-            quality = [cv2.IMWRITE_JPEG_QUALITY, int(p['preview_quality'])]
-            with _lock:
-                _preview = cv2.imencode('.jpg', small, quality)[1].tobytes()
-            if p['mode'] == 0:
-                self._control(self._find_tags(arr), p)
+        pw = int(p['preview_width'])
+        small = cv2.resize(arr, (pw, max(1, round(pw * h / w))))
+        quality = [cv2.IMWRITE_JPEG_QUALITY, int(p['preview_quality'])]
+        with _lock:
+            _preview = cv2.imencode('.jpg', small, quality)[1].tobytes()
+
+    # ---- detections -> control ----
 
     def _det_cb(self, msg):
         with _lock:
             p = dict(_params)
-        if p['mode'] != 1:
-            return
         dets = []
         for d in msg.detections:
             score, label = 1.0, ''
@@ -135,80 +144,45 @@ class PursuitNode(Node):
             dets.append({'cx': d.bbox.center.position.x, 'cy': d.bbox.center.position.y,
                          'w': d.bbox.size_x, 'h': d.bbox.size_y,
                          'score': round(score, 3), 'label': label})
-        self._control(dets, p)
-
-    def _find_tags(self, arr):
-        gray = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
-        corners, ids = self._aruco(gray)
-        dets = []
-        for i, quad in enumerate(corners):
-            xs, ys = quad[0][:, 0], quad[0][:, 1]
-            dets.append({'cx': float(xs.mean()), 'cy': float(ys.mean()),
-                         'w': float(xs.max() - xs.min()), 'h': float(ys.max() - ys.min()),
-                         'score': 1.0,
-                         'label': f'tag {int(ids[i][0])}' if ids is not None else 'tag'})
-        return dets
-
-    # ---- control ----
-
-    def _control(self, dets, p):
-        W, H = self._res
+        # Candidates: above threshold, best scores first, capped at max_detections.
         dets = [d for d in dets if d['score'] >= p['score_threshold']]
+        dets.sort(key=lambda d: d['score'], reverse=True)
+        dets = dets[:int(p['max_detections'])]
         target = max(dets, key=lambda d: d['w'] * d['h'], default=None)
 
         if target is None:
-            # Detection drops out for a frame or two all the time (motion
-            # blur, tag angle). Slamming the throttle to zero on each miss
-            # and restarting the ramp reads as jerking, so coast on the last
-            # command through a short grace window and only stop when the
-            # target is genuinely gone.
-            if time.monotonic() - self._last_target > STALE_SEC:
-                self._publish_stopped(dets)
-            else:
-                out = AckermannDriveStamped()
-                out.drive.speed = float(self._speed_cmd)
-                out.drive.steering_angle = float(-self._last_cmd)
-                self._pub.publish(out)
-                self._update_state(dets, None, None, self._last_cmd, None)
+            # Keep doing the last command. Only the display updates.
+            self._update_state(dets, None, None, None)
             return
-        self._last_target = time.monotonic()
 
+        W, H = self._res
         error = (target['cx'] - W / 2) / (W / 2)  # -1 left .. +1 right
         cmd = p['angle_kp'] * error + p['angle_kd'] * (error - self._last_error)
         self._last_error = error
-        cmd = max(-1.0, min(1.0, cmd))
-        self._last_cmd = cmd
+        self._steer_cmd = max(-1.0, min(1.0, cmd))
 
         # Brake as the box area approaches safety_area; stop at or past it.
         area = (target['w'] * target['h']) / (W * H)
         target_speed = p['speed'] * max(0.0, 1.0 - area / max(p['safety_area'], 1e-3))
         self._speed_cmd += p['speed_kp'] * (target_speed - self._speed_cmd)
         self._speed_cmd = max(0.0, min(1.0, self._speed_cmd))
+        self._update_state(dets, target, error, area)
 
+    def _actuate(self):
         out = AckermannDriveStamped()
         out.drive.speed = float(self._speed_cmd)
-        out.drive.steering_angle = float(-cmd)  # wire positive = left on this car
+        out.drive.steering_angle = float(-self._steer_cmd)  # wire positive = left
         self._pub.publish(out)
-        self._update_state(dets, target, error, cmd, area)
 
-    def _publish_stopped(self, dets):
-        self._speed_cmd = 0.0
-        self._pub.publish(AckermannDriveStamped())
-        self._update_state(dets, None, None, 0.0, None)
-
-    def _watchdog(self):
-        """No target for STALE_SEC (camera died, tag gone): keep zeros flowing."""
-        if time.monotonic() - self._last_target > STALE_SEC and self._speed_cmd > 0:
-            self._publish_stopped([])
-
-    def _update_state(self, dets, target, error, cmd, area):
+    def _update_state(self, dets, target, error, area):
         with _lock:
             _state.update({
                 'detections': dets, 'target': target,
                 'error': None if error is None else round(error, 3),
-                'steer': round(cmd, 3), 'speed_cmd': round(self._speed_cmd, 3),
                 'area': None if area is None else round(area, 4),
-                'res': list(self._res), 'seen': target is not None,
+                'steer': round(self._steer_cmd, 3),
+                'speed_cmd': round(self._speed_cmd, 3),
+                'res': list(self._res),
             })
 
 
@@ -237,10 +211,11 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
             with _lock:
                 for k in ('speed', 'speed_kp', 'safety_area', 'angle_kp',
-                          'angle_kd', 'score_threshold'):
+                          'angle_kd', 'score_threshold', 'max_detections'):
                     if k in data:
                         _params[k] = float(data[k])
                 _params['speed'] = max(0.0, min(1.0, _params['speed']))
+                _params['max_detections'] = max(1, int(_params['max_detections']))
         elif self.path == '/save':
             save_params()
         elif self.path == '/load':
@@ -268,9 +243,7 @@ def main():
     rclpy.init()
     node = PursuitNode()
     threading.Thread(target=rclpy.spin, args=(node,), daemon=True).start()
-    with _lock:
-        mode = _params['mode']
-    print(f'Pure pursuit dashboard on http://0.0.0.0:{PORT} (mode={mode})')
+    print(f'Pure pursuit dashboard on http://0.0.0.0:{PORT}')
     ThreadingHTTPServer(('0.0.0.0', PORT), Handler).serve_forever()
 
 

@@ -1,5 +1,5 @@
 [Unit]
-Description=Neoracer Pure Pursuit Dashboard (port 8084)
+Description=Neoracer Pure Pursuit Dashboard (port 8083)
 After=neoracer-teleop.service
 
 [Service]

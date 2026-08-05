@@ -34,10 +34,10 @@
 <div class="topbar">
 <div>
 <h1>Pure Pursuit Dashboard</h1>
-<div class="meta">mode: <b id="mode">?</b> &bull; target: <b id="tgt">none</b> &bull; error: <b id="err">?</b>
-  &bull; steer: <b id="steer">?</b> &bull; throttle: <b id="thr">?</b></div>
+<div class="meta">model: <b id="model">?</b> &bull; camera: <b id="fps">?</b> fps &bull; target: <b id="tgt">none</b>
+  &bull; error: <b id="err">?</b> &bull; steer: <b id="steer">?</b> &bull; throttle: <b id="thr">?</b></div>
 </div>
-<button onclick="reset()" title="Re-read pursuit.yaml, picks up a mode switch">Reset</button>
+<button onclick="reset()" title="Re-read pursuit.yaml">Reset</button>
 </div>
 <main>
 <div class="grid">
@@ -57,15 +57,17 @@
 </main>
 
 <script>
-const FIELDS = ['speed', 'speed_kp', 'safety_area', 'angle_kp', 'angle_kd', 'score_threshold'];
+const FIELDS = ['speed', 'speed_kp', 'safety_area', 'angle_kp', 'angle_kd',
+                'score_threshold', 'max_detections'];
 const UNITS = {
   speed: '0 to 1 throttle cap', speed_kp: 'stopping gain',
   safety_area: 'stop at this bbox area, 0..1 of image',
   angle_kp: 'steer per unit offset', angle_kd: 'steering damper',
   score_threshold: 'ignore detections below, 0..1',
+  max_detections: 'keep this many best scores',
 };
 const STEPS = { speed_kp: '0.01', angle_kp: '0.01', angle_kd: '0.01',
-                safety_area: '0.01', score_threshold: '0.05' };
+                safety_area: '0.01', score_threshold: '0.05', max_detections: '1' };
 
 const c = document.getElementById('cam'), ctx = c.getContext('2d');
 const img = new Image();
@@ -142,7 +144,8 @@ function draw() {
 function update() {
   fetch('/state').then(r => r.json()).then(d => {
     last = d;
-    document.getElementById('mode').textContent = d.params.mode == 1 ? 'cars' : 'AR tags';
+    document.getElementById('model').textContent = d.model;
+    document.getElementById('fps').textContent = d.cam_fps;
     document.getElementById('tgt').textContent = d.target
       ? `${d.target.label} (area ${(d.area * 100).toFixed(1)}%)` : 'none';
     document.getElementById('err').textContent = d.error ?? '?';
@@ -151,7 +154,7 @@ function update() {
     buildForm(d.params);
     document.getElementById('detail').textContent =
       `${d.detections.length} detection(s). Yellow dashes: stop size (safety_area). ` +
-      `Red box: the target being chased. No target = stopped.`;
+      `Red box: the target being chased. No target: the last command keeps driving.`;
   }).catch(() => {});
 }
 
