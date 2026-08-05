@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pure Pursuit Dashboard</title>
+<style>
+  /* Neobotics tokens, same scheme as the wallfollow dashboard. */
+  :root { --white: #FFFFFF; --halo: #F5F5F7; --steel: #E2E2E2; --carbon: #1D1D27; --tarmac: #1B2036; --red: #FF0033; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; background: var(--white); color: var(--carbon); }
+  .topbar { background: var(--tarmac); color: var(--halo); padding: 0.8rem 1.5rem; display: flex; justify-content: space-between; align-items: center; }
+  .topbar h1 { font-family: 'Space Grotesk', 'Helvetica Neue', sans-serif; font-size: 1.3rem; }
+  .topbar button { background: transparent; border: 1px solid rgba(245, 245, 247, 0.5); color: var(--halo); font-family: inherit; padding: 0.4rem 1rem; border-radius: 6px; cursor: pointer; margin: 0; }
+  .topbar button:hover { background: rgba(245, 245, 247, 0.15); }
+  .meta { color: rgba(245, 245, 247, 0.72); font-size: 0.85rem; margin-top: 0.2rem; }
+  .meta b { color: var(--white); }
+  main { padding: 1rem 1.5rem; }
+  .grid { display: grid; grid-template-columns: 1fr 300px; gap: 1rem; }
+  @media (max-width: 1000px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: var(--white); border: 1px solid var(--steel); border-radius: 12px; padding: 1rem; box-shadow: 0 6px 18px rgba(29, 29, 39, 0.08); }
+  .card h2 { font-family: 'Space Grotesk', 'Helvetica Neue', sans-serif; font-size: 1rem; color: var(--tarmac); margin-bottom: 0.5rem; }
+  canvas { background: var(--tarmac); border-radius: 6px; width: 100%; max-width: 560px; display: block; }
+  label { display: block; color: rgba(29, 29, 39, 0.6); font-size: 0.8rem; margin-top: 0.6rem; }
+  input { width: 100%; background: var(--white); border: 1px solid var(--steel); color: var(--carbon); font-family: inherit; padding: 0.3rem; border-radius: 6px; }
+  input[type=range] { accent-color: var(--red); border: none; padding: 0; }
+  button { background: var(--white); border: 1px solid var(--tarmac); color: var(--tarmac); font-family: inherit; padding: 0.35rem 0.8rem; border-radius: 6px; margin: 0.8rem 0.4rem 0 0; cursor: pointer; }
+  button:hover { background: var(--steel); }
+  .readout { font-size: 0.85rem; margin-top: 0.5rem; white-space: pre-line; }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+<div>
+<h1>Pure Pursuit Dashboard</h1>
+<div class="meta">mode: <b id="mode">?</b> &bull; target: <b id="tgt">none</b> &bull; error: <b id="err">?</b>
+  &bull; steer: <b id="steer">?</b> &bull; throttle: <b id="thr">?</b></div>
+</div>
+<button onclick="reset()" title="Re-read pursuit.yaml, picks up a mode switch">Reset</button>
+</div>
+<main>
+<div class="grid">
+  <div class="card">
+    <h2>Camera</h2>
+    <canvas id="cam" width="640" height="480"></canvas>
+    <div class="readout" id="detail"></div>
+  </div>
+  <div class="card">
+    <h2>Tune</h2>
+    <div id="form"></div>
+    <button onclick="apply()">Apply</button>
+    <button onclick="post('/save')">Save</button>
+    <button onclick="reset()">Load</button>
+  </div>
+</div>
+</main>
+
+<script>
+const FIELDS = ['speed', 'speed_kp', 'safety_area', 'angle_kp', 'angle_kd', 'score_threshold'];
+const UNITS = {
+  speed: '0 to 1 throttle cap', speed_kp: 'stopping gain',
+  safety_area: 'stop at this bbox area, 0..1 of image',
+  angle_kp: 'steer per unit offset', angle_kd: 'steering damper',
+  score_threshold: 'ignore detections below, 0..1',
+};
+const STEPS = { speed_kp: '0.01', angle_kp: '0.01', angle_kd: '0.01',
+                safety_area: '0.01', score_threshold: '0.05' };
+
+const c = document.getElementById('cam'), ctx = c.getContext('2d');
+const img = new Image();
+let last = null;
+img.onload = draw;
+
+// Pull frames one at a time so a congested link drops frame rate instead
+// of building a lag queue. Pauses when the tab is hidden.
+(function liveLoop() {
+  if (document.hidden) { setTimeout(liveLoop, 250); return; }
+  const t = Date.now();
+  const done = () => {
+    img.removeEventListener('load', done); img.removeEventListener('error', done);
+    setTimeout(liveLoop, Math.max(20, 160 - (Date.now() - t)));
+  };
+  img.addEventListener('load', done); img.addEventListener('error', done);
+  img.src = '/frame?' + t;
+})();
+
+function post(path, body) {
+  return fetch(path, { method: 'POST', body: body ? JSON.stringify(body) : null });
+}
+
+function reset() {
+  post('/load').then(() => { document.getElementById('form').dataset.built = ''; });
+}
+
+function apply() {
+  const out = {};
+  for (const f of FIELDS) out[f] = parseFloat(document.getElementById('in_' + f).value);
+  post('/params', out);
+}
+
+function buildForm(params) {
+  const form = document.getElementById('form');
+  if (form.dataset.built) return;  // rebuild only on Reset/Load so typing survives
+  form.dataset.built = '1';
+  form.innerHTML = FIELDS.map(f => f === 'speed'
+    ? `<label>speed (${UNITS.speed}) <b id="speedval">${params.speed}</b>
+       <input id="in_speed" type="range" min="0" max="1" step="0.01" value="${params.speed}"
+        oninput="document.getElementById('speedval').textContent = this.value;
+                 post('/params', {speed: parseFloat(this.value)})"></label>`
+    : `<label>${f} (${UNITS[f]})<input id="in_${f}" type="number" step="${STEPS[f] || 'any'}" value="${params[f]}"></label>`
+  ).join('');
+}
+
+function draw() {
+  ctx.drawImage(img, 0, 0, c.width, c.height);
+  if (!last) return;
+  const [W, H] = last.res[0] ? last.res : [c.width, c.height];
+  const sx = c.width / W, sy = c.height / H;
+  ctx.font = '13px Helvetica'; ctx.lineWidth = 2;
+  for (const d of last.detections) {
+    const isTgt = last.target && d.cx === last.target.cx && d.cy === last.target.cy;
+    ctx.strokeStyle = isTgt ? '#FF0033' : 'rgba(245, 245, 247, 0.6)';
+    ctx.strokeRect((d.cx - d.w / 2) * sx, (d.cy - d.h / 2) * sy, d.w * sx, d.h * sy);
+    ctx.fillStyle = ctx.strokeStyle;
+    ctx.fillText(`${d.label} ${d.score < 1 ? d.score : ''}`,
+                 (d.cx - d.w / 2) * sx + 3, (d.cy - d.h / 2) * sy - 4);
+  }
+  // Safety area reference: a centered box of the stop size. When the red
+  // target box grows past this outline, the car is fully stopped.
+  const p = last.params;
+  const aw = Math.sqrt(p.safety_area * 4 / 3) * c.width * 0.866;
+  const ah = aw * 0.75;
+  ctx.strokeStyle = '#FFD700'; ctx.setLineDash([6, 4]);
+  ctx.strokeRect((c.width - aw) / 2, (c.height - ah) / 2, aw, ah);
+  ctx.setLineDash([]);
+  // Center line the steering chases
+  ctx.strokeStyle = 'rgba(245, 245, 247, 0.35)';
+  ctx.beginPath(); ctx.moveTo(c.width / 2, 0); ctx.lineTo(c.width / 2, c.height); ctx.stroke();
+}
+
+function update() {
+  fetch('/state').then(r => r.json()).then(d => {
+    last = d;
+    document.getElementById('mode').textContent = d.params.mode == 1 ? 'cars' : 'AR tags';
+    document.getElementById('tgt').textContent = d.target
+      ? `${d.target.label} (area ${(d.area * 100).toFixed(1)}%)` : 'none';
+    document.getElementById('err').textContent = d.error ?? '?';
+    document.getElementById('steer').textContent = d.steer;
+    document.getElementById('thr').textContent = d.speed_cmd;
+    buildForm(d.params);
+    document.getElementById('detail').textContent =
+      `${d.detections.length} detection(s). Yellow dashes: stop size (safety_area). ` +
+      `Red box: the target being chased. No target = stopped.`;
+  }).catch(() => {});
+}
+
+update();
+setInterval(update, 200);
+</script>
+</body>
+</html>
