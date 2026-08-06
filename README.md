@@ -2,23 +2,45 @@
 
 Target-following as a service for the Neoracer, on port 8083. The car chases whatever the driver's YOLO inference node detects: PD steering on the target's horizontal offset, throttle that brakes as the target's bounding box grows toward a stop size.
 
+## Contents
+
+- [Install](#install)
+- [Service control](#service-control)
+- [Detection and control](#detection-and-control)
+- [Tuning](#tuning)
+- [Known conflicts on the car](#known-conflicts-on-the-car)
+- [Safety](#safety)
+
 ## Install
 
-From a laptop on the car's network:
+On the car:
 
 ```
-scp -r pursuit_dashboard racecar@<car-ip>:~/pursuit
-ssh racecar@<car-ip> 'bash ~/pursuit/setup.sh'
+git clone https://github.com/Neobotics-Foundation-Inc/pursuit_dashboard.git
+bash pursuit_dashboard/setup.sh
 ```
 
-Setup installs, enables at boot, and starts the service in one step. Dashboard: `http://<car-ip>:8083`.
+setup.sh points neoracer-pursuit.service at this checkout wherever it sits and copies nothing, so the repository can live anywhere the racecar user can read. A first install leaves the service stopped and disabled; start it with `bash setup.sh enable`. Dashboard: `http://<car-ip>:8083`.
 
-```
-bash ~/pursuit/setup.sh disable    # stop now and stay off across boots
-bash ~/pursuit/setup.sh enable     # turn it back on
-```
+Re-running setup.sh updates the unit and leaves the enable state alone: a running service restarts on the new code, a stopped one stays stopped.
 
-## How it works
+## Service control
+
+Run on the car, from the checkout:
+
+| Command | Effect |
+| --- | --- |
+| `bash setup.sh` | install or update the unit; a first install does not start it |
+| `bash setup.sh enable` | start now and at every boot |
+| `bash setup.sh disable` | stop now and keep off across boots |
+| `bash setup.sh restart` | restart; takes port 8083 back first |
+| `bash setup.sh remove` | stop, disable, and uninstall the unit; files here are kept |
+
+Enable, restart, and an update of a running service clear port 8083 first. A dashboard left over from an earlier install under a different unit name or directory, or any other service on 8083, is stopped through systemd; a `pursuit.py` started by hand is signalled directly. Without this the new instance would fail to bind and loop on `Restart=on-failure`.
+
+After `remove`, the checkout and its tuned pursuit.yaml stay in place; `bash setup.sh` reinstalls.
+
+## Detection and control
 
 Detections come from the driver inference node (vision_msgs/Detection2DArray on /edgetpu/inference). Detections below score_threshold are dropped, the best-scoring max_detections remain as candidates, and the largest box is the target. The model being served and the camera frame rate show in the top bar; the model is whatever model_path in the driver's inference.yaml points to.
 

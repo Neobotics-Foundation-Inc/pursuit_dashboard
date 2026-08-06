@@ -9,11 +9,11 @@ Group=racecar
 ExecStart=/bin/bash -c '\
     source /opt/ros/humble/setup.bash && \
     source /home/racecar/ros2_ws/install/setup.bash && \
-    exec python3 /home/racecar/pursuit/pursuit.py'
+    exec python3 @DIR@/pursuit.py'
 Restart=on-failure
 RestartSec=5
 Environment=HOME=/home/racecar
-WorkingDirectory=/home/racecar/pursuit
+WorkingDirectory=@DIR@
 
 [Install]
 WantedBy=multi-user.target
