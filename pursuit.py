@@ -23,6 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import re
+import signal
 import threading
 import time
 
@@ -30,6 +31,7 @@ from ackermann_msgs.msg import AckermannDriveStamped
 import cv2
 import numpy as np
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
@@ -238,13 +240,39 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+def _spin(node):
+    try:
+        rclpy.spin(node)
+    except ExternalShutdownException:
+        pass
+
+
 def main():
     load_params()
     rclpy.init()
     node = PursuitNode()
-    threading.Thread(target=rclpy.spin, args=(node,), daemon=True).start()
+    spin = threading.Thread(target=_spin, args=(node,), daemon=True)
+    spin.start()
+    server = ThreadingHTTPServer(('0.0.0.0', PORT), Handler)
+
+    # rclpy.init() installs SIGINT/SIGTERM handlers that shut the ROS context
+    # down but leave serve_forever() blocked, so the process outlives the
+    # signal until systemd's TimeoutStopSec expires and SIGKILLs it. Take the
+    # signals back. shutdown() has to run off the serving thread or it
+    # deadlocks waiting for the loop it is called from.
+    def stop(*_):
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
     print(f'Pure pursuit dashboard on http://0.0.0.0:{PORT}')
-    ThreadingHTTPServer(('0.0.0.0', PORT), Handler).serve_forever()
+    server.serve_forever()
+
+    # Unwind the ROS wait before the interpreter tears the context down;
+    # otherwise the spin thread aborts the process from C++.
+    rclpy.shutdown()
+    spin.join(timeout=2)
 
 
 if __name__ == '__main__':
