@@ -48,7 +48,9 @@ If no object is found the car KEEPS THE LAST ACTUATED COMMAND, speed and angle b
 
 ## Tuning
 
-All on the dashboard, live: speed (throttle cap, drag slider, applies while dragging), speed_kp (stopping gain), safety_area (bbox area fraction where the car fully stops; the yellow dashed outline on the camera view is this size), angle_kp, angle_kd, score_threshold, max_detections. Save writes pursuit.yaml, Reset re-reads it.
+All on the dashboard, live: speed (throttle cap, drag slider, applies while dragging; it moves only with a sideways drag, never with a tap or a scroll that starts on it, and always shows the speed the car has), speed_kp (stopping gain), safety_area (bbox area fraction where the car fully stops; the yellow dashed outline on the camera view is this size), angle_kp, angle_kd, score_threshold, max_detections. Save writes pursuit.yaml, Reset re-reads it.
+
+The page works with a mouse, a touch screen or the keyboard, on a laptop, a tablet or a phone, in a light or a dark theme (the switch in the top bar). The number fields have − and + buttons that repeat while held.
 
 ## Known conflicts on the car
 
